@@ -1,0 +1,20 @@
+# variables = {
+#     "incoming variable name from data provider": {
+#         "vargem": "Synoptic Variable Table Vargem",
+#         "VNUM": "Synotic VNUM",
+#         "long_name": "Long name description",
+#         "incoming_unit": "incoming data unit from data provider",
+#         "final_unit": "final unit that POE is expecting (should be metric unit if keeping units in json slug)"
+#     }
+# }
+
+# for example, here is a key from the variables dict used in the nasa globe ingest
+variables = {
+    "airtempsCurrentTemp": {
+        "vargem": "TMPF",
+        "VNUM": "1",
+        "long_name": "Air Temperature",
+        "incoming_unit": "degC",
+        "final_unit": "degC"
+    }
+}
