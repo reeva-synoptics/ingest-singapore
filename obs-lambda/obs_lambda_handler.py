@@ -1,40 +1,77 @@
 import logging
-from datetime import datetime, timezone, timedelta, UTC
-from ingestlib import poe, parse, aws, validator, metamgr,  core
-from data_dictionary import variables
 import os
 import time
 import json
 import posixpath
+import requests
+
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from functools import partial
+
+from ingestlib import poe, parse, aws, validator, metamgr, core
+from data_dictionary import variables
+
 
 ########################################################################################################################
 # DEFINE LOGSTREAMS AND CONSTANTS
 ########################################################################################################################
-INGEST_NAME = 'INGEST_NAME' #TODO Update Ingest Name
+INGEST_NAME = "ingest_singapore"
 logger = logging.getLogger(f"{INGEST_NAME}_ingest")
 
+DATA_GOV_BASE = "https://api-open.data.gov.sg/v2/real-time/api"
+
+
 ########################################################################################################################
-# DEFINE ETL/PARSING FUNCTIONS
+# DATA FETCH
 ########################################################################################################################
-def cache_raw_data_simple(incoming_data, work_dir: str, s3_bucket_name: str, s3_prefix: str):
+
+def fetch_singapore_weather(endpoint: str, api_key: str, timeout: int = 30):
     """
-    Simple function that saves raw data with timestamp - no diffing or merging.
-    Each run creates a unique timestamped file.
+    Fetch weather data from Singapore's data.gov.sg API (v2)
+    
+    Args:
+        endpoint: API endpoint to fetch from (e.g., 'air-temperature')
+        api_key: API key for authentication
+        timeout: Request timeout in seconds
+    
+    Returns:
+        JSON response data or None if failed
     """
+    # Get current date in YYYY-MM-DD format for v2 API
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    url = f"{DATA_GOV_BASE}/{endpoint}?date={current_date}"
+    headers = {
+        "X-Api-Key": api_key
+    }
+    logger.info(f"FETCH: {url}")
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"FETCH FAILED [{endpoint}]: {e}")
+        return None
+
+
+########################################################################################################################
+# RAW DATA CACHE
+########################################################################################################################
+
+def cache_raw_data_simple(incoming_data, work_dir, s3_bucket_name, s3_prefix):
     try:
         if not incoming_data:
             logger.debug("CACHE: no incoming data; skipping")
             return False
 
         # Create timestamp-based filename
-        timestamp = datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
 
         # Create S3 path: prefix/YYYY/MM/YYYYMMDD_HHMMSS.json
-        year_month = datetime.now(datetime.timezone.utc).strftime('%Y/%m')
+        year_month = datetime.now(timezone.utc).strftime('%Y/%m')
         s3_key = f"{s3_prefix}/{year_month}/{timestamp}.json"
-        
+
         # Local file setup
         os.makedirs(work_dir, exist_ok=True)
         local_file_path = os.path.join(work_dir, f"{timestamp}.json")
@@ -68,6 +105,45 @@ def cache_raw_data_simple(incoming_data, work_dir: str, s3_bucket_name: str, s3_
     except Exception as e:
         logger.error(f"CACHE: unexpected error: {e}")
         return False
+
+
+
+########################################################################################################################
+# PARSING
+########################################################################################################################
+
+def parse_weather_data(incoming_data):
+    """
+    Convert data.gov.sg responses into grouped_obs_set
+    Handles v2 API format where data.readings contains array of readings with array of station data
+    """
+    grouped = defaultdict(list)
+
+    for dataset, payload in incoming_data.items():
+        if not payload:
+            continue
+
+        readings = payload.get("data", {}).get("readings", [])
+        stations = payload.get("data", {}).get("stations", [])
+        station_lookup = {s["id"]: s for s in stations}
+
+        for r in readings:
+            timestamp = r["timestamp"]
+            # v2 API: r["data"] is an array of {stationId, value} objects
+            data_array = r.get("data", [])
+            for station_data in data_array:
+                station_id = station_data.get("stationId")
+                value = station_data.get("value")
+                if station_id and value is not None:
+                    grouped[station_id].append({
+                        "dattim": timestamp,
+                        "variable": dataset,
+                        "value": value,
+                        "station_meta": station_lookup.get(station_id, {})
+                    })
+
+    return grouped
+
 
 ########################################################################################################################
 # MAIN FUNCTION
@@ -132,11 +208,43 @@ def main(event, context):
         # Determine the time before which data will not be archived between script runs to identify new data
         PREVIOUS_HOURS_TO_RETAIN = 12
         # Look back for recent data
-        data_archive_time = datetime.now(UTC) - timedelta(hours=PREVIOUS_HOURS_TO_RETAIN)
+        data_archive_time = datetime.now(timezone.utc) - timedelta(hours=PREVIOUS_HOURS_TO_RETAIN)
 
-        ########################################################################################################################
+        ####################################################################################################
+        # GET API KEY FROM SECRETS MANAGER
+        ####################################################################################################
+        
+        # Retrieve API key from AWS Secrets Manager
+        logger.info("Retrieving API key from Secrets Manager...")
+        try:
+            secret = aws.SecretsManager.get(secret_name="ingest/singapore")
+            try:
+                secret_dict = json.loads(secret)  # Parse string to dictionary
+                api_key = secret_dict.get('api_key')
+                if not api_key:
+                    logger.error("API key not found in secret")
+                    raise ValueError("Missing 'api_key' in secret")
+                logger.info("API key retrieved successfully")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing secret as JSON: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Failed to retrieve API key: {e}")
+            # For local development, fallback to environment variable or hardcoded value
+            if args.local_run or args.dev:
+                api_key = os.environ.get("SINGAPORE_API_KEY", "v2:d3b930df370d50cc30e866bfd3453950686ed461beb376f7ee9960f06d6bffda:7Oplg4nROHkwafTPraU-IrogfLDdMcf7")
+                logger.warning(f"Using fallback API key for local/dev run")
+            else:
+                raise
+        
+        # Strip v2: prefix if present (AWS Secrets Manager format)
+        if api_key.startswith("v2:"):
+            api_key = api_key[3:]
+            logger.debug("Stripped v2: prefix from API key")
+
+        ####################################################################################################
         # GET LATEST OBS
-        ########################################################################################################################
+        ####################################################################################################
 
         # load station metadata file
         if os.path.exists(station_meta_file):
@@ -147,7 +255,18 @@ def main(event, context):
         
 
         logger.info("FETCH: starting data fetch request")
-        incoming_data = #TODO grab the incoming data here
+
+        incoming_data = {
+            "air_temperature": fetch_singapore_weather("air-temperature", api_key),
+            "rainfall": fetch_singapore_weather("rainfall", api_key),
+            "relative_humidity": fetch_singapore_weather("relative-humidity", api_key),
+            "wind_speed": fetch_singapore_weather("wind-speed", api_key),
+            "wind_direction": fetch_singapore_weather("wind-direction", api_key)
+        }
+
+        # drop failed calls
+        incoming_data = {k: v for k, v in incoming_data.items() if v}
+
         logger.info(f"FETCH: got data? {bool(incoming_data)}")
         
         # store raw raw incoming data in the data provider raw cache bucket
@@ -162,13 +281,40 @@ def main(event, context):
         if incoming_data:
             logger.info(msg=json.dumps({'Incoming_Data_Success': 1}))
 
-            #TODO Write parsing function here!
-            grouped_obs_set = #TODO parse the latest data here!
-            grouped_obs = ['|'.join([k, json.dumps(v)]).replace(' ', '') for k, v in grouped_obs_set.items()] 
-
-            ########################################################################################################################
+            # Write parsing function here!
+            grouped_obs_set = parse_weather_data(incoming_data)
+            # Format: station_id|unix_timestamp|{"variable": value, ...}
+            grouped_obs = []
+            for station_id, obs_list in grouped_obs_set.items():
+                # Group observations by timestamp
+                by_timestamp = defaultdict(dict)
+                for obs in obs_list:
+                    timestamp_str = obs["dattim"]
+                    variable = obs["variable"]
+                    value = obs["value"]
+                    by_timestamp[timestamp_str][variable] = value
+                
+                # Create observation strings: station_id|YYYYMMDDHHMM|{data}
+                for timestamp_str, data in by_timestamp.items():
+                    # Convert ISO 8601 to YYYYMMDDHHMM format for validator
+                    # Singapore API returns timestamps in SGT (UTC+8)
+                    try:
+                        # Parse the timestamp - Singapore API returns SGT (UTC+8)
+                        dt = datetime.fromisoformat(timestamp_str.replace("Z", "+08:00"))
+                        # Convert to UTC
+                        dt_utc = dt.astimezone(timezone.utc)
+                        # Format as YYYYMMDDHHMM (12 digits) in UTC
+                        dattim_str = dt_utc.strftime("%Y%m%d%H%M")
+                    except Exception as e:
+                        logger.warning(f"Failed to parse timestamp {timestamp_str}: {e}")
+                        # Fallback to current time if parsing fails
+                        dattim_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+                    
+                    obs_str = "|".join([station_id, dattim_str, json.dumps(data)]).replace(" ", "")
+                    grouped_obs.append(obs_str)
+            ####################################################################################################
             # VALIDATE DATA
-            ########################################################################################################################
+            ####################################################################################################
             # save the grouped obs and station meta if it exists
             if args.local_run or args.dev:
                 dev_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../dev'))
@@ -187,11 +333,15 @@ def main(event, context):
                     with open(station_meta_path, 'w') as f:
                         json.dump(station_meta, f, indent=4)
                     logger.debug(f"[DEV] Saved station_meta to {station_meta_path}")
-
+            
             if args.dev or args.local_run:
-                # Time window: last 24 hours
-                end_time = datetime.now(UTC)
-                start_time = end_time - timedelta(hours=24)
+                # Time window: allow observations from the entire current day + next day
+                # API returns observations throughout the day, so we need to be permissive
+                now = datetime.now(timezone.utc)
+                # Set end_time to end of next day to allow all current day observations
+                end_time = (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
+                # Set start_time to 48 hours ago to cover current and previous day
+                start_time = now - timedelta(hours=48)
 
                 # Try to fetch variables_table unless local_run
                 variables_table = {}

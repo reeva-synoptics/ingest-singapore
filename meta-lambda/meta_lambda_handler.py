@@ -50,14 +50,14 @@ import re, unicodedata
 ########################################################################################################################
 # DEFINE CONSTANTS
 ########################################################################################################################
-INGEST_NAME = #TODO Update Ingest Name
+INGEST_NAME = "singapore"
 M_TO_FEET = 3.28084
 ELEVATION_UNIT = 'METERS' # ELEVATION UNIT OF THIS INGESTS METADATA MUST BE EITHER 'METERS' OR 'FEET'. METAMOTH CURRENTLY STORES ELEVATION IN FEET, SO WE WILL CONVERT IF IT'S IN METERS. 
-MNET_ID = # CREATE NEW MNET_ID FOR THIS INGEST
-MNET_SHORTNAME = #TODO add the mnet shortname
+MNET_ID = 340 # CREATE NEW MNET_ID FOR THIS INGEST
+MNET_SHORTNAME = "Singapore" #TODO add the mnet shortname
 RESTRICTED_DATA_STATUS = False # True or False, IS THE DATA RESTRICTED?
 RESTRICTED_METADATA_STATUS = False # True or False, IS THE METADATA RESTRICTED?
-STID_PREFIX = #TODO add the stid prefix
+STID_PREFIX = "SMI" #TODO add the stid prefix
 
 ########################################################################################################################
 # DEFINE LOGS
@@ -243,9 +243,52 @@ def main(event,context):
         # --------------- 2. RAW METADATA COLLECTION (if not collected already by obs lambda) ---------------
         # Fetch initial metadata as raw_meta variable, ideally this is from a metadata specific endpoint, although it's possible this doesn't exist...
         
-        raw_data = #TODO fetch the raw metadata if apt
+        # Load raw data from dev folder (cached from obs handler)
+        raw_data_file = os.path.join(work_dir, "20260120_081905.json")
+        raw_data = {}
+        
+        if os.path.exists(raw_data_file):
+            try:
+                with open(raw_data_file, 'r', encoding='utf-8') as f:
+                    raw_data = json.load(f)
+                logger.info(f"Loaded raw metadata from {raw_data_file}")
+            except Exception as e:
+                logger.warning(f"Failed to load raw data from {raw_data_file}: {e}")
+                raw_data = {}
+        else:
+            logger.warning(f"Raw data file not found at {raw_data_file}, using empty dataset")
+        
         # --------------- 3. METADATA PROCESSING ---------------
-        station_meta = #TODO parse the raw data to something that generate_metadata_payload() can process
+        station_meta = {}
+        
+        # Extract station metadata from raw API data
+        if raw_data:
+            for dataset_name, dataset_payload in raw_data.items():
+                if not dataset_payload or "data" not in dataset_payload:
+                    continue
+                
+                stations = dataset_payload.get("data", {}).get("stations", [])
+                
+                for station in stations:
+                    station_id = station.get("id")
+                    if not station_id:
+                        continue
+                    
+                    # Create or update station metadata entry
+                    if station_id not in station_meta:
+                        location = station.get("location", {})
+                        station_meta[station_id] = {
+                            "SYNOPTIC_STID": f"{STID_PREFIX}_{station_id}",  # Combine prefix with station ID
+                            "NAME": station.get("name", f"Station {station_id}"),
+                            "LAT": location.get("latitude"),
+                            "LON": location.get("longitude"),
+                            "OTID": station.get("deviceId", station_id),
+                            "ELEVATION": None,  # Not provided by data.gov.sg
+                            "RESTRICTED_DATA": RESTRICTED_DATA_STATUS,
+                            "RESTRICTED_METADATA": RESTRICTED_METADATA_STATUS
+                        }
+        
+        logger.info(f"Parsed {len(station_meta)} stations from raw metadata")
 
         # --------------- 4. STATION LOOKUP PAYLOAD CREATION ---------------
         station_lookup_payload = generate_metadata_payload(station_meta=station_meta, payload_type='station_lookup')

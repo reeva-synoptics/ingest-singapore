@@ -10,11 +10,40 @@
 
 # for example, here is a key from the variables dict used in the nasa globe ingest
 variables = {
-    "airtempsCurrentTemp": {
+    "air_temperature": {
         "vargem": "TMPF",
         "VNUM": "1",
         "long_name": "Air Temperature",
         "incoming_unit": "degC",
         "final_unit": "degC"
-    }
-}
+    },
+    "relative_humidity": {
+        "vargem": "RELH",
+        "VNUM": "1",
+        "long_name": "Relative Humidity",
+        "incoming_unit": "pct",
+        # "%"
+        "final_unit": "pct"
+    },
+    "rainfall": {
+        "vargem": "PREC",
+        "VNUM": "1",
+        "long_name": "Rainfall",
+        "incoming_unit": "mm",
+        "final_unit": "mm"
+    },
+    "wind_speed": {
+        "vargem": "SKNT",
+        "VNUM": "1",
+        "long_name": "Wind Speed",
+        "incoming_unit": "KT",
+        "final_unit": "mps"         
+    },    
+     "wind_direction": {
+        "vargem": "DRCT",
+        "VNUM": "1",
+        "long_name": "Wind Direction",
+        "incoming_unit": "deg",
+        "final_unit": "deg"         
+    },
+},
