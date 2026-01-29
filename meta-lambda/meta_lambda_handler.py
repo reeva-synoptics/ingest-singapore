@@ -15,6 +15,7 @@ import boto3
 import json
 import logging
 import time
+import concurrent.futures
 from ingestlib import station_lookup, parse, core
 import math
 import posixpath
@@ -57,7 +58,7 @@ MNET_ID = 340 # CREATE NEW MNET_ID FOR THIS INGEST
 MNET_SHORTNAME = "Singapore" #TODO add the mnet shortname
 RESTRICTED_DATA_STATUS = False # True or False, IS THE DATA RESTRICTED?
 RESTRICTED_METADATA_STATUS = False # True or False, IS THE METADATA RESTRICTED?
-STID_PREFIX = "SMI" #TODO add the stid prefix
+STID_PREFIX = "SNEA" #TODO add the stid prefix
 
 ########################################################################################################################
 # DEFINE LOGS
@@ -160,26 +161,150 @@ def generate_metadata_payload(station_meta, payload_type, source_info=None):
     return json.dumps(payload, indent=4) if payload_type == "metamanager" else payload
 
 
-def update_stations(url: str, headers: dict, payload: str) -> requests.Response:
-    """
-    Sends a PUT request to update station data.
-
-    Args:
-        url (str): The URL to send the request to.
-        headers (dict): The headers to include in the request.
-        payload (str): The payload data in JSON format.
-
-    Returns:
-        requests.Response: The response from the server.
-    """
-    response = requests.request("PUT", url, headers=headers, data=payload)
-    return response
-
-# Function to save data to a JSON file
 def save_to_json(data, filename):
+    """Save data to a JSON file."""
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, 'w') as f:
         json.dump(data, f, indent=4)
+
+
+def fetch_singapore_station_metadata(api_key):
+    """
+    Fetch station metadata from Singapore data.gov.sg API.
+    
+    This function queries the Singapore API to extract station metadata including
+    station IDs, names, and geographic coordinates.
+    
+    Args:
+        api_key (str): API key for Singapore data.gov.sg API
+        
+    Returns:
+        dict: Station metadata in the format:
+        {
+            "station_id": {
+                "SYNOPTIC_STID": str,
+                "NAME": str,
+                "LAT": float,
+                "LON": float,
+                "OTID": str,
+                "ELEVATION": float or None,
+                "RESTRICTED_DATA": bool,
+                "RESTRICTED_METADATA": bool
+            }
+        }
+    """
+    station_meta = {}
+    
+    try:
+        # Base URL for Singapore data.gov.sg API
+        base_url = "https://api-open.data.gov.sg/v2/real-time/api"
+        headers = {"X-Api-Key": api_key}
+        
+        # List of observation endpoints that contain station metadata
+        # These endpoints return data with station information embedded
+        endpoints = [
+            "air-temperature",
+            "relative-humidity",
+            "wind-speed",
+            "wind-direction",
+            "rainfall"
+        ]
+        
+        logger.debug(f"Fetching station metadata from {len(endpoints)} endpoints")
+        
+        # Fetch from each endpoint to collect station information
+        for endpoint in endpoints:
+            try:
+                url = f"{base_url}/{endpoint}"
+                logger.debug(f"Fetching metadata from: {url}")
+                
+                response = requests.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                # Parse station information from the response
+                if "data" in data and "stations" in data["data"]:
+                    stations = data["data"]["stations"]
+                    
+                    for station in stations:
+                        station_id = station.get("id")
+                        
+                        if not station_id:
+                            logger.debug(f"Skipping station without ID from {endpoint}")
+                            continue
+                        
+                        # Skip if we've already processed this station
+                        if station_id in station_meta:
+                            logger.debug(f"Station {station_id} already in metadata, skipping")
+                            continue
+                        
+                        try:
+                            # Extract station information
+                            name = station.get("name", f"Station {station_id}")
+                            location = station.get("location", {})
+                            lat = location.get("latitude")
+                            lon = location.get("longitude")
+                            device_id = station.get("deviceId", station_id)
+                            
+                            # Validate coordinates
+                            if lat is None or lon is None:
+                                logger.debug(f"Skipping station {station_id}: missing coordinates")
+                                continue
+                            
+                            try:
+                                lat = float(lat)
+                                lon = float(lon)
+                            except (ValueError, TypeError):
+                                logger.debug(f"Skipping station {station_id}: invalid coordinate format")
+                                continue
+                            
+                            # Validate coordinate ranges
+                            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                                logger.debug(f"Skipping station {station_id}: coordinates out of range ({lat}, {lon})")
+                                continue
+                            
+                            if lat == 0 and lon == 0:
+                                logger.debug(f"Skipping station {station_id}: null island coordinates")
+                                continue
+                            
+                            # Create STID (unique station identifier)
+                            synoptic_stid = f"{STID_PREFIX}{station_id}"
+                            
+                            # Build station metadata entry
+                            station_meta[station_id] = {
+                                "SYNOPTIC_STID": synoptic_stid,
+                                "NAME": name,
+                                "LAT": lat,
+                                "LON": lon,
+                                "OTID": device_id,
+                                "ELEVATION": None,  # Not provided by Singapore data.gov.sg API
+                                "RESTRICTED_DATA": RESTRICTED_DATA_STATUS,
+                                "RESTRICTED_METADATA": RESTRICTED_METADATA_STATUS
+                            }
+                            
+                            logger.debug(f"Added station {station_id}: {name} ({lat}, {lon})")
+                        
+                        except Exception as e:
+                            logger.debug(f"Error processing station {station_id}: {e}")
+                            continue
+                
+                else:
+                    logger.debug(f"No stations data in {endpoint} response")
+            
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Failed to fetch from {endpoint}: {e}")
+                continue
+            except Exception as e:
+                logger.warning(f"Error processing {endpoint}: {e}")
+                continue
+        
+        logger.info(f"Successfully fetched metadata for {len(station_meta)} stations")
+        return station_meta
+    
+    except Exception as e:
+        logger.error(f"Error fetching station metadata: {e}")
+        return {}
 
 ########################################################################################################################
 # MAIN FUNCTION
@@ -214,12 +339,23 @@ def main(event,context):
     
     start_runtime = time.time()
     try:
+        # ========================================================================
+        # S3 Configuration
+        # ========================================================================
+        # Bucket: INTERNAL_BUCKET_NAME = "ingest-singapore" (from environment)
+        # S3 Keys:
+        #   - Metadata file: metadata/singapore_stations_metadata.json
+        #   - Metadata prefix: metadata/
+        #   - SQL files: metadata/*.sql (auto-cleaned)
+        # ========================================================================
+        
         # Declare S3 Paths for Metadata Storage
         s3_bucket_name = os.environ.get('INTERNAL_BUCKET_NAME')
         if not s3_bucket_name:
             raise ValueError("Missing INTERNAL_BUCKET_NAME env var.")
 
         s3_meta_work_dir = "metadata"
+        # S3 Key: metadata/singapore_stations_metadata.json
         s3_station_meta_file = posixpath.join(s3_meta_work_dir, f"{INGEST_NAME}_stations_metadata.json")
 
         # Declare Local Paths
@@ -228,6 +364,7 @@ def main(event,context):
         station_meta_file = os.path.join(work_dir, f"{INGEST_NAME}_stations_metadata.json")
 
         # Load Existing Stations and Payload Files
+        existing_stations = {}
         try:
             aws.S3.download_file(bucket=s3_bucket_name, object_key=s3_station_meta_file, local_directory=work_dir)
             with open(station_meta_file, 'r', encoding='utf-8') as json_file:
@@ -240,111 +377,68 @@ def main(event,context):
         ########################################################################################################################
         # Fetch Metadata
         ########################################################################################################################
+
+        # --------------- 1. SECRET MANAGEMENT (if applicable) ---------------
+        # Retrieve and parse API credentials from AWS Secrets Manager
+        secret = aws.SecretsManager.get(secret_name="ingest/singapore")
+        try:
+            secret_dict = json.loads(secret)  # Parse string to dictionary
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing secret as JSON: {e}")
+            raise
+        api_key = secret_dict['api_key']
+        logger.debug("API key retrieved from AWS Secrets Manager")
+        
         # --------------- 2. RAW METADATA COLLECTION (if not collected already by obs lambda) ---------------
         # Fetch initial metadata as raw_meta variable, ideally this is from a metadata specific endpoint, although it's possible this doesn't exist...
+        # Fetch station metadata from Singapore data.gov.sg API
+        updated_meta = fetch_singapore_station_metadata(api_key=api_key)
         
-        # Load raw data from dev folder (cached from obs handler)
-        raw_data_file = os.path.join(work_dir, "20260120_081905.json")
-        raw_data = {}
-        
-        if os.path.exists(raw_data_file):
-            try:
-                with open(raw_data_file, 'r', encoding='utf-8') as f:
-                    raw_data = json.load(f)
-                logger.info(f"Loaded raw metadata from {raw_data_file}")
-            except Exception as e:
-                logger.warning(f"Failed to load raw data from {raw_data_file}: {e}")
-                raw_data = {}
-        else:
-            logger.warning(f"Raw data file not found at {raw_data_file}, using empty dataset")
-        
-        # --------------- 3. METADATA PROCESSING ---------------
-        station_meta = {}
-        
-        # Extract station metadata from raw API data
-        if raw_data:
-            for dataset_name, dataset_payload in raw_data.items():
-                if not dataset_payload or "data" not in dataset_payload:
-                    continue
-                
-                stations = dataset_payload.get("data", {}).get("stations", [])
-                
-                for station in stations:
-                    station_id = station.get("id")
-                    if not station_id:
-                        continue
-                    
-                    # Create or update station metadata entry
-                    if station_id not in station_meta:
-                        location = station.get("location", {})
-                        station_meta[station_id] = {
-                            "SYNOPTIC_STID": f"{STID_PREFIX}_{station_id}",  # Combine prefix with station ID
-                            "NAME": station.get("name", f"Station {station_id}"),
-                            "LAT": location.get("latitude"),
-                            "LON": location.get("longitude"),
-                            "OTID": station.get("deviceId", station_id),
-                            "ELEVATION": None,  # Not provided by data.gov.sg
-                            "RESTRICTED_DATA": RESTRICTED_DATA_STATUS,
-                            "RESTRICTED_METADATA": RESTRICTED_METADATA_STATUS
-                        }
-        
-        logger.info(f"Parsed {len(station_meta)} stations from raw metadata")
-
-        # --------------- 4. STATION LOOKUP PAYLOAD CREATION ---------------
-        station_lookup_payload = generate_metadata_payload(station_meta=station_meta, payload_type='station_lookup')
+        if not updated_meta:
+            logger.warning("No station metadata fetched from Singapore API")
 
         # SAVE TO LOCAL DEV (if local_run)
         if args.local_run:
             dev_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../dev'))
             os.makedirs(dev_dir, exist_ok=True)
-
-            # Save station_meta locally
-            station_meta_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_stations_metadata.json')
+            
+            # Save station_meta to dev directory
+            station_meta_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_station_meta.json')
             with open(station_meta_dev_path, 'w') as f:
-                json.dump(station_meta, f, indent=4)
-
-            # Save station_lookup_payload locally
-            lookup_payload_dev_path = os.path.join(dev_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            with open(lookup_payload_dev_path, 'w') as f:
-                json.dump(station_lookup_payload, f, indent=4)
-
+                json.dump(updated_meta, f, indent=4)
+            
             logger.debug(f"[DEV] Saved station_meta to {station_meta_dev_path}")
-            logger.debug(f"[DEV] Saved station_lookup_payload to {lookup_payload_dev_path}")
-            logger.debug(f"[DEV] Station count: {len(station_meta)}")
+            logger.debug(f"[DEV] Station count: {len(updated_meta)}")
 
+        # --------------- 3. METADATA PROCESSING ---------------
+        # Process data into a format that can be prepared for station lookup or metamanager payload, store as station_meta. Should be a Dictionary
+        station_lookup_payload = generate_metadata_payload(station_meta=updated_meta, payload_type='station_lookup', source_info=None)
+
+        # --------------- 4. STATION LOOKUP PROCESSING ---------------
+        # Generate and execute station lookup via ingestlib
+        
         if not args.local_run:
+            logger.debug('production station lookup proceeding')
+            
             try:
-                logger.debug('production station lookup proceeding')
-                station_lookup.load_metamgr(station_lookup_payload, logstream=logger, mode='prod', output_location=work_dir)
-                logger.debug('past station lookup')
+                station_lookup.load_metamgr(station_lookup_payload, mode='prod', logstream=logger, output_location=work_dir)
+                logger.debug('station lookup completed successfully')
             except Exception as e:
                 logger.exception(f"Station lookup failed: {e}")
                 raise
-
+            
             # --------------- 5. DATA PERSISTENCE ---------------
-
-            # Save and upload station_meta
-            save_to_json(data=station_meta, filename=station_meta_file)
-            aws.S3.upload_file(
-                local_file_path=station_meta_file,
-                bucket=s3_bucket_name,
-                s3_key=s3_station_meta_file
-            )
-
-            # Save and upload station_lookup_payload
-            station_lookup_file = os.path.join(work_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            save_to_json(data=station_lookup_payload, filename=station_lookup_file)
-            s3_lookup_key = os.path.join(s3_meta_work_dir, f'{INGEST_NAME}_station_lookup_payload.json')
-            aws.S3.upload_file(
-                local_file_path=station_lookup_file,
-                bucket=s3_bucket_name,
-                s3_key=s3_lookup_key
-            )
+            # Save updated metadata
+            save_to_json(data=updated_meta, filename=station_meta_file)
+            aws.S3.upload_file(local_file_path=station_meta_file, 
+                            bucket=s3_bucket_name, 
+                            s3_key=s3_station_meta_file)
+            logger.info(f"Saved {len(updated_meta)} stations to {s3_station_meta_file}")
 
             # Clean up old SQL files
             deleted_files_count = aws.S3.delete_files(
-                bucket=s3_bucket_name,
-                prefix=s3_meta_work_dir,
+                bucket=s3_bucket_name, 
+                prefix=s3_meta_work_dir, 
                 endswith=".sql"
             )
             logger.debug(f"Deleted {deleted_files_count} SQL files from the bucket {s3_bucket_name}")
@@ -364,20 +458,10 @@ def main(event,context):
                                     bucket=s3_bucket_name, 
                                     s3_key=s3_sql)
 
-        logger.info(msg=json.dumps({'completion': 1, 'time': time.time() - start_runtime}))
-        
-    except Exception as e:
-        logger.error(msg=json.dumps({'completion': 0, 'time': time.time() - start_runtime}))
-        raise 
-        
-    finally:
         total_runtime = time.time() - start_runtime
-        logger.info(f"Total execution time: {total_runtime:.2f} seconds")
-
-
-        # 2) prod only: upload the *exact* file we just wrote
-        if (not args.local_run) and (not args.dev) and log_file and s3_bucket_name:
-            s3_log_key = posixpath.join(s3_work_dir, f"{INGEST_NAME}_meta.log")
-            aws.S3.upload_file(local_file_path=log_file, bucket=s3_bucket_name, s3_key=s3_log_key)
-        
-        logging.shutdown()
+        logger.info(msg=json.dumps({'completion': 1, 'time': total_runtime}))
+    except Exception as e:
+        total_runtime = time.time() - start_runtime
+        logger.exception(f"Unhandled exception: {e}")
+        logger.error(msg=json.dumps({'completion': 0, 'time': total_runtime}))
+   

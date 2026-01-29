@@ -9,7 +9,7 @@ os.environ['LOCAL_RUN'] = 'True'
 os.environ['LOG_LEVEL'] = 'DEBUG'
 os.environ['FIRST_RUN'] = 'True'
 # Set any required environment variables
-os.environ['INTERNAL_BUCKET_NAME'] = "ingest-singapore"
+os.environ['INTERNAL_BUCKET_NAME'] = "synoptic-ingest-singapore-sp014"
 
 # Must load these AFTER setting Args above
 from meta_lambda_handler import main
