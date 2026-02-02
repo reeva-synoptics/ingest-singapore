@@ -4,10 +4,12 @@ import time
 
 # Set Args BEFORE loading Args below
 os.environ['AWS_PROFILE'] = 'ingest'
-os.environ['DEV'] = 'True'
-os.environ['LOCAL_RUN'] = 'True'
+os.environ['DEV'] = 'False'
+os.environ['LOCAL_RUN'] = 'False'
 os.environ['LOG_LEVEL'] = 'DEBUG'
-os.environ['FIRST_RUN'] = 'True'
+os.environ['DB_HOST'] = '127.0.0.1'
+os.environ['DB_PORT'] = '3306'
+os.environ['AWS_REGION'] = 'us-west-2'
 # Set any required environment variables
 os.environ['INTERNAL_BUCKET_NAME'] = "synoptic-ingest-singapore-sp014"
 

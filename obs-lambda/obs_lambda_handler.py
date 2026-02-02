@@ -4,13 +4,11 @@ import time
 import json
 import posixpath
 import requests
-
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-from functools import partial
-
+from datetime import datetime, timezone, timedelta
 from ingestlib import poe, parse, aws, validator, metamgr, core
 from data_dictionary import variables
+from collections import defaultdict
+from functools import partial
 
 
 ########################################################################################################################
@@ -108,41 +106,6 @@ def cache_raw_data_simple(incoming_data, work_dir, s3_bucket_name, s3_prefix):
 
 
 
-########################################################################################################################
-# PARSING
-########################################################################################################################
-
-def parse_weather_data(incoming_data):
-    """
-    Convert data.gov.sg responses into grouped_obs_set
-    Handles v2 API format where data.readings contains array of readings with array of station data
-    """
-    grouped = defaultdict(list)
-
-    for dataset, payload in incoming_data.items():
-        if not payload:
-            continue
-
-        readings = payload.get("data", {}).get("readings", [])
-        stations = payload.get("data", {}).get("stations", [])
-        station_lookup = {s["id"]: s for s in stations}
-
-        for r in readings:
-            timestamp = r["timestamp"]
-            # v2 API: r["data"] is an array of {stationId, value} objects
-            data_array = r.get("data", [])
-            for station_data in data_array:
-                station_id = station_data.get("stationId")
-                value = station_data.get("value")
-                if station_id and value is not None:
-                    grouped[station_id].append({
-                        "dattim": timestamp,
-                        "variable": dataset,
-                        "value": value,
-                        "station_meta": station_lookup.get(station_id, {})
-                    })
-
-    return grouped
 
 
 ########################################################################################################################
@@ -282,36 +245,50 @@ def main(event, context):
             logger.info(msg=json.dumps({'Incoming_Data_Success': 1}))
 
             # Write parsing function here!
-            grouped_obs_set = parse_weather_data(incoming_data)
-            # Format: station_id|unix_timestamp|{"variable": value, ...}
-            grouped_obs = []
-            for station_id, obs_list in grouped_obs_set.items():
-                # Group observations by timestamp
+            # Parse incoming data into grouped_obs_set: dict with key 'station_id|dattim_str' and value {'vargem': {'1': value}, ...}
+            # This matches the POE expected format: station_id|YYYYMMDDHHMM|{"VAR": {"1": value}}
+            grouped_obs_set = {}
+            grouped_temp = defaultdict(list)
+            for dataset, payload in incoming_data.items():
+                if not payload:
+                    continue
+                readings = payload.get("data", {}).get("readings", [])
+                stations = payload.get("data", {}).get("stations", [])
+                station_lookup = {s["id"]: s for s in stations}
+                for r in readings:
+                    timestamp = r["timestamp"]
+                    data_array = r.get("data", [])
+                    for station_data in data_array:
+                        station_id = station_data.get("stationId")
+                        value = station_data.get("value")
+                        if station_id and value is not None:
+                            grouped_temp[station_id].append({
+                                "dattim": timestamp,
+                                "variable": dataset,
+                                "value": value,
+                                "station_meta": station_lookup.get(station_id, {})
+                            })
+            for station_id, obs_list in grouped_temp.items():
                 by_timestamp = defaultdict(dict)
                 for obs in obs_list:
                     timestamp_str = obs["dattim"]
-                    variable = obs["variable"]
+                    dataset = obs["variable"]
                     value = obs["value"]
-                    by_timestamp[timestamp_str][variable] = value
-                
-                # Create observation strings: station_id|YYYYMMDDHHMM|{data}
+                    # Map dataset to vargem
+                    print(f"variables type: {type(variables)}, dataset: {dataset}")
+                    variable = variables[dataset]["vargem"]
+                    by_timestamp[timestamp_str][variable] = {"1": value}
                 for timestamp_str, data in by_timestamp.items():
-                    # Convert ISO 8601 to YYYYMMDDHHMM format for validator
-                    # Singapore API returns timestamps in SGT (UTC+8)
                     try:
-                        # Parse the timestamp - Singapore API returns SGT (UTC+8)
                         dt = datetime.fromisoformat(timestamp_str.replace("Z", "+08:00"))
-                        # Convert to UTC
                         dt_utc = dt.astimezone(timezone.utc)
-                        # Format as YYYYMMDDHHMM (12 digits) in UTC
                         dattim_str = dt_utc.strftime("%Y%m%d%H%M")
                     except Exception as e:
                         logger.warning(f"Failed to parse timestamp {timestamp_str}: {e}")
-                        # Fallback to current time if parsing fails
                         dattim_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
-                    
-                    obs_str = "|".join([station_id, dattim_str, json.dumps(data)]).replace(" ", "")
-                    grouped_obs.append(obs_str)
+                    key = f"{station_id}|{dattim_str}"
+                    grouped_obs_set[key] = data
+            grouped_obs = ['|'.join([k, json.dumps(v)]).replace(' ', '') for k, v in grouped_obs_set.items()]
             ####################################################################################################
             # VALIDATE DATA
             ####################################################################################################
@@ -335,13 +312,9 @@ def main(event, context):
                     logger.debug(f"[DEV] Saved station_meta to {station_meta_path}")
             
             if args.dev or args.local_run:
-                # Time window: allow observations from the entire current day + next day
-                # API returns observations throughout the day, so we need to be permissive
-                now = datetime.now(timezone.utc)
-                # Set end_time to end of next day to allow all current day observations
-                end_time = (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=999999)
-                # Set start_time to 48 hours ago to cover current and previous day
-                start_time = now - timedelta(hours=48)
+                # Time window: last 24 hours
+                end_time = datetime.now(timezone.utc)
+                start_time = end_time - timedelta(hours=24)
 
                 # Try to fetch variables_table unless local_run
                 variables_table = {}

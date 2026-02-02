@@ -22,7 +22,6 @@ variables = {
         "VNUM": "1",
         "long_name": "Relative Humidity",
         "incoming_unit": "pct",
-        # "%"
         "final_unit": "pct"
     },
     "rainfall": {
@@ -39,11 +38,11 @@ variables = {
         "incoming_unit": "KT",
         "final_unit": "mps"         
     },    
-     "wind_direction": {
+    "wind_direction": {
         "vargem": "DRCT",
         "VNUM": "1",
         "long_name": "Wind Direction",
         "incoming_unit": "deg",
-        "final_unit": "deg"         
-    },
-},
+        "final_unit": "deg"
+    }
+}

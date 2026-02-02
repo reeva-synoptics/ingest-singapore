@@ -3,7 +3,7 @@ import json
 import time
 
 # Set Args BEFORE loading Args below
-os.environ['AWS_PROFILE'] = 'ingest'
+os.environ['AWS_PROFILE'] = 'default'
 os.environ['DEV'] = 'True'
 os.environ['LOCAL_RUN'] = 'True'
 os.environ['LOG_LEVEL'] = 'DEBUG'
