@@ -14,7 +14,7 @@ from functools import partial
 ########################################################################################################################
 # DEFINE LOGSTREAMS AND CONSTANTS
 ########################################################################################################################
-INGEST_NAME = "ingest_singapore"
+INGEST_NAME = "singapore"
 logger = logging.getLogger(f"{INGEST_NAME}_ingest")
 
 DATA_GOV_BASE = "https://api-open.data.gov.sg/v2/real-time/api"
@@ -269,6 +269,14 @@ def main(event, context):
                                 "station_meta": station_lookup.get(station_id, {})
                             })
             for station_id, obs_list in grouped_temp.items():
+                # Get synoptic_stid from station metadata
+                if station_id in station_meta:
+                    synoptic_stid = station_meta[station_id].get('SYNOPTIC_STID', station_id)
+                else:
+                    # If station not in metadata, skip or use raw station_id as fallback
+                    logger.warning(f"Station {station_id} not found in station_meta, skipping")
+                    continue
+    
                 by_timestamp = defaultdict(dict)
                 for obs in obs_list:
                     timestamp_str = obs["dattim"]
@@ -286,7 +294,7 @@ def main(event, context):
                     except Exception as e:
                         logger.warning(f"Failed to parse timestamp {timestamp_str}: {e}")
                         dattim_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
-                    key = f"{station_id}|{dattim_str}"
+                    key = f"{synoptic_stid}|{dattim_str}"
                     grouped_obs_set[key] = data
             grouped_obs = ['|'.join([k, json.dumps(v)]).replace(' ', '') for k, v in grouped_obs_set.items()]
             ####################################################################################################

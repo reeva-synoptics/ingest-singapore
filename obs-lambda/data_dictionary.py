@@ -25,7 +25,7 @@ variables = {
         "final_unit": "pct"
     },
     "rainfall": {
-        "vargem": "PREC",
+        "vargem": "	P05I",
         "VNUM": "1",
         "long_name": "Rainfall",
         "incoming_unit": "mm",

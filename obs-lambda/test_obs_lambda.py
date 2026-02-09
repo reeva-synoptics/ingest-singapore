@@ -3,13 +3,17 @@ import json
 import time
 
 # Set Args BEFORE loading Args below
-os.environ['AWS_PROFILE'] = 'default'
+os.environ['AWS_PROFILE'] = 'ingest'
 os.environ['DEV'] = 'True'
-os.environ['LOCAL_RUN'] = 'True'
+os.environ['LOCAL_RUN'] = 'False'
 os.environ['LOG_LEVEL'] = 'DEBUG'
 
+# POE Configuration - USE THE TUNNEL!
+os.environ['POE_SOCKET_ADDRESS'] = 'localhost' 
+os.environ['POE_SOCKET_PORT'] = '18095' 
+
 # Set any required environment variables
-os.environ['INTERNAL_BUCKET_NAME'] = "ingest-singapore"
+os.environ['INTERNAL_BUCKET_NAME'] = "synoptic-ingest-singapore-sp014"
 
 # Must load these AFTER setting Args above
 from obs_lambda_handler import main
