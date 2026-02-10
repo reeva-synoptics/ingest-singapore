@@ -11,6 +11,8 @@ os.environ['LOG_LEVEL'] = 'DEBUG'
 # POE Configuration - USE THE TUNNEL!
 os.environ['POE_SOCKET_ADDRESS'] = 'localhost' 
 os.environ['POE_SOCKET_PORT'] = '18095' 
+os.environ['METAMGR_SOCKET_ADDRESS'] = 'localhost'
+os.environ['METAMGR_SOCKET_PORT'] = '18888'
 
 # Set any required environment variables
 os.environ['INTERNAL_BUCKET_NAME'] = "synoptic-ingest-singapore-sp014"

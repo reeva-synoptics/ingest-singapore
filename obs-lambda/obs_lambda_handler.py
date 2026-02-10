@@ -42,7 +42,7 @@ def fetch_singapore_weather(endpoint: str, api_key: str, timeout: int = 30):
     headers = {
         "X-Api-Key": api_key
     }
-    logger.info(f"FETCH: {url}")
+    logger.debug(f"FETCH: {url}")
 
     try:
         resp = requests.get(url, headers=headers, timeout=timeout)
@@ -74,7 +74,7 @@ def cache_raw_data_simple(incoming_data, work_dir, s3_bucket_name, s3_prefix):
         os.makedirs(work_dir, exist_ok=True)
         local_file_path = os.path.join(work_dir, f"{timestamp}.json")
 
-        logger.info(f"CACHE: target s3://{s3_bucket_name}/{s3_key}")
+        logger.debug(f"CACHE: target s3://{s3_bucket_name}/{s3_key}")
 
         # Save data to local file
         try:
@@ -109,8 +109,68 @@ def cache_raw_data_simple(incoming_data, work_dir, s3_bucket_name, s3_prefix):
 
 
 ########################################################################################################################
-# MAIN FUNCTION
+# PARSING FUNCTION
 ########################################################################################################################
+def parse_incoming_data(incoming_data, station_meta):
+    """
+    Parse incoming data into grouped observations with the expected format.
+    """
+    grouped_obs_set = {}
+    grouped_temp = defaultdict(list)
+
+    for dataset, payload in incoming_data.items():
+        if not payload:
+            continue
+        readings = payload.get("data", {}).get("readings", [])
+        stations = payload.get("data", {}).get("stations", [])
+        station_lookup = {s["id"]: s for s in stations}
+        for r in readings:
+            timestamp = r["timestamp"]
+            data_array = r.get("data", [])
+            for station_data in data_array:
+                station_id = station_data.get("stationId")
+                value = station_data.get("value")
+                if station_id and value is not None:
+                    grouped_temp[station_id].append({
+                        "dattim": timestamp,
+                        "variable": dataset,
+                        "value": value,
+                        "station_meta": station_lookup.get(station_id, {})
+                    })
+
+    for station_id, obs_list in grouped_temp.items():
+        if station_id in station_meta:
+            synoptic_stid = station_meta[station_id].get('SYNOPTIC_STID', station_id)
+        else:
+            logger.warning(f"Station {station_id} not found in station_meta, skipping")
+            continue
+
+        by_timestamp = defaultdict(dict)
+        for obs in obs_list:
+            timestamp_str = obs["dattim"]
+            dataset = obs["variable"]
+            value = obs["value"]
+            # Map dataset to vargem
+            print(f"variables type: {type(variables)}, dataset: {dataset}")
+            variable = variables[dataset]["vargem"]
+            by_timestamp[timestamp_str][variable] = {"1": value}
+
+        for timestamp_str, data in by_timestamp.items():
+            try:
+                dt = datetime.fromisoformat(timestamp_str.replace("Z", "+08:00"))
+                dt_utc = dt.astimezone(timezone.utc)
+                dattim_str = dt_utc.strftime("%Y%m%d%H%M")
+            except Exception as e:
+                logger.warning(f"Failed to parse timestamp {timestamp_str}: {e}")
+                dattim_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+            key = f"{synoptic_stid}|{dattim_str}"
+            grouped_obs_set[key] = data
+
+    # Convert to list of strings
+    grouped_obs = ['|'.join([k, json.dumps(v)]).replace(' ', '') for k, v in grouped_obs_set.items()]
+    return grouped_obs
+
+# Main execution function
 def main(event, context):
     from args import args
 
@@ -143,7 +203,7 @@ def main(event, context):
     success_flag = 0
 
     try:
-        logger.info("BOOT: ECS logging path OK")
+        logger.debug("BOOT: ECS logging path OK")
 
         # paths
         os.makedirs(work_dir, exist_ok=True)
@@ -178,7 +238,7 @@ def main(event, context):
         ####################################################################################################
         
         # Retrieve API key from AWS Secrets Manager
-        logger.info("Retrieving API key from Secrets Manager...")
+        logger.debug("Retrieving API key from Secrets Manager...")
         try:
             secret = aws.SecretsManager.get(secret_name="ingest/singapore")
             try:
@@ -217,8 +277,9 @@ def main(event, context):
 
         
 
-        logger.info("FETCH: starting data fetch request")
+        logger.debug("FETCH: starting data fetch request")
 
+        # Fetch latest data
         incoming_data = {
             "air_temperature": fetch_singapore_weather("air-temperature", api_key),
             "rainfall": fetch_singapore_weather("rainfall", api_key),
@@ -230,7 +291,7 @@ def main(event, context):
         # drop failed calls
         incoming_data = {k: v for k, v in incoming_data.items() if v}
 
-        logger.info(f"FETCH: got data? {bool(incoming_data)}")
+        logger.debug(f"FETCH: got data? {bool(incoming_data)}")
         
         # store raw raw incoming data in the data provider raw cache bucket
         cache_raw_data_simple(
@@ -244,59 +305,8 @@ def main(event, context):
         if incoming_data:
             logger.info(msg=json.dumps({'Incoming_Data_Success': 1}))
 
-            # Write parsing function here!
-            # Parse incoming data into grouped_obs_set: dict with key 'station_id|dattim_str' and value {'vargem': {'1': value}, ...}
-            # This matches the POE expected format: station_id|YYYYMMDDHHMM|{"VAR": {"1": value}}
-            grouped_obs_set = {}
-            grouped_temp = defaultdict(list)
-            for dataset, payload in incoming_data.items():
-                if not payload:
-                    continue
-                readings = payload.get("data", {}).get("readings", [])
-                stations = payload.get("data", {}).get("stations", [])
-                station_lookup = {s["id"]: s for s in stations}
-                for r in readings:
-                    timestamp = r["timestamp"]
-                    data_array = r.get("data", [])
-                    for station_data in data_array:
-                        station_id = station_data.get("stationId")
-                        value = station_data.get("value")
-                        if station_id and value is not None:
-                            grouped_temp[station_id].append({
-                                "dattim": timestamp,
-                                "variable": dataset,
-                                "value": value,
-                                "station_meta": station_lookup.get(station_id, {})
-                            })
-            for station_id, obs_list in grouped_temp.items():
-                # Get synoptic_stid from station metadata
-                if station_id in station_meta:
-                    synoptic_stid = station_meta[station_id].get('SYNOPTIC_STID', station_id)
-                else:
-                    # If station not in metadata, skip or use raw station_id as fallback
-                    logger.warning(f"Station {station_id} not found in station_meta, skipping")
-                    continue
-    
-                by_timestamp = defaultdict(dict)
-                for obs in obs_list:
-                    timestamp_str = obs["dattim"]
-                    dataset = obs["variable"]
-                    value = obs["value"]
-                    # Map dataset to vargem
-                    print(f"variables type: {type(variables)}, dataset: {dataset}")
-                    variable = variables[dataset]["vargem"]
-                    by_timestamp[timestamp_str][variable] = {"1": value}
-                for timestamp_str, data in by_timestamp.items():
-                    try:
-                        dt = datetime.fromisoformat(timestamp_str.replace("Z", "+08:00"))
-                        dt_utc = dt.astimezone(timezone.utc)
-                        dattim_str = dt_utc.strftime("%Y%m%d%H%M")
-                    except Exception as e:
-                        logger.warning(f"Failed to parse timestamp {timestamp_str}: {e}")
-                        dattim_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
-                    key = f"{synoptic_stid}|{dattim_str}"
-                    grouped_obs_set[key] = data
-            grouped_obs = ['|'.join([k, json.dumps(v)]).replace(' ', '') for k, v in grouped_obs_set.items()]
+            # Parse incoming data into observations
+            grouped_obs = parse_incoming_data(incoming_data, station_meta)
             ####################################################################################################
             # VALIDATE DATA
             ####################################################################################################
