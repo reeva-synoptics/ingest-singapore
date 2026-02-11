@@ -272,10 +272,6 @@ def main(event, context):
         # load station metadata file
         if os.path.exists(station_meta_file):
             station_meta = parse.load_json_file(file_path=station_meta_file)
-        else:
-            station_meta = {}
-
-        
 
         logger.debug("FETCH: starting data fetch request")
 
